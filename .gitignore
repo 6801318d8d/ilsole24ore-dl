@@ -1,0 +1,6 @@
+/data
+/src/logs
+/src/mylogin.py
+/src/geckodriver.log
+/src/__pycache__
+.python-version
