@@ -4,9 +4,10 @@
     python src/ilsole24ore_dl.py 2026-11-16   issue of that date
 
 The viewer's issue index (get_timone.php) lists the pages; each page is served as
-8 GIF tiles (2 columns x 4 rows), which are stitched at full resolution, cropped
-to the printed area and written to data/final/IlSole24Ore_<date>.pdf. Tiles are
-cached in data/download/, so an interrupted run resumes where it stopped.
+8 GIF tiles (2 columns x 4 rows). All tiles are downloaded at once (cached in
+data/download/, so an interrupted run resumes); then each page is stitched at full
+resolution, cropped to the printed area and JPEG-encoded as soon as its tiles are in, and
+the pages are merged without re-encoding into data/final/IlSole24Ore_<date>.pdf.
 """
 
 import argparse
@@ -26,13 +27,14 @@ from urllib3.util.retry import Retry
 
 INDEX_URL = "https://www.quotidiano.ilsole24ore.com/sfoglio/_resources/php/get_timone.php"
 CDN = "https://mobapp2.ilsole24ore.com/_deploy/"
-EDITIONS = ("SOLE", "LUNEDI")  # Monday's issue is the LUNEDI edition
 TILES = 8  # per page, 2 columns x 4 rows
 LOOKBACK_DAYS = 7  # latest issue: from tomorrow (published the evening before) back this many days
-WORKERS = 8
+DOWNLOAD_THREADS = 32  # 192 tiles: 1.0 s with 8 threads, 0.6-0.8 s with 32, no gain beyond
+PAGE_THREADS = 8  # stitch/crop/encode; threads beat processes: spawning 12 processes on Windows takes 1.3 s
 DPI = 200  # stitched pages are ~2,750 px wide for a 35 cm page
 MARGIN = 20  # px kept around the printed area
-JPEG_QUALITY = 85
+CROP_SCALE = 4  # the blank border is measured on the page reduced 4 times: 4 px accuracy, 16x fewer pixels
+JPEG_QUALITY = 85  # same look as 92 at 200 % zoom (PSNR 40 dB), 49 MB instead of 63 MB per issue
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
 DATA = Path(__file__).resolve().parent.parent / "data"
 
@@ -41,7 +43,7 @@ def session():
     s = requests.Session()
     s.headers["User-Agent"] = UA
     retry = Retry(total=4, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504))
-    s.mount("https://", HTTPAdapter(pool_maxsize=WORKERS, max_retries=retry))
+    s.mount("https://", HTTPAdapter(pool_maxsize=DOWNLOAD_THREADS, max_retries=retry))
     return s
 
 
@@ -55,29 +57,32 @@ def issue_index(s, day, edition):
 
 
 def find_issue(s, day=None):
-    """(date, index) of the issue of DAY or, without DAY, of the latest issue."""
+    """(date, index) of the issue of DAY or, without DAY, of the latest issue.
+    Sequential on one kept-alive connection: 18 parallel requests took 1.1 s, 4 in a row 0.3 s."""
     days = [day] if day else [dt.date.today() + dt.timedelta(days=1 - k) for k in range(LOOKBACK_DAYS + 2)]
     for d in days:
-        for edition in EDITIONS:
+        for edition in ("LUNEDI", "SOLE") if d.weekday() == 0 else ("SOLE", "LUNEDI"):  # likely one first
             if index := issue_index(s, d, edition):
                 return d, index
     sys.exit(f"No issue found for {days[-1]}" + (f" to {days[0]}" if len(days) > 1 else ""))
 
 
-def tile(s, url, path):
-    if not path.is_file():
-        r = s.get(url, timeout=60)
-        r.raise_for_status()
-        if not r.content.startswith(b"GIF"):
-            raise RuntimeError(f"not a GIF: {url}")
-        path.with_suffix(".part").write_bytes(r.content)
-        path.with_suffix(".part").replace(path)
-    return Image.open(io.BytesIO(path.read_bytes()))  # from memory: no open handle blocks the cleanup
+def fetch(s, url, path):
+    """Download a tile, unless it is already cached."""
+    if path.is_file():
+        return
+    r = s.get(url, timeout=60)
+    r.raise_for_status()
+    if not r.content.startswith(b"GIF"):
+        raise RuntimeError(f"not a GIF: {url}")
+    part = path.with_suffix(".part")
+    part.write_bytes(r.content)
+    part.replace(path)
 
 
 def stitch(tiles):
     """Tiles in reading order, two per row, into one RGB page."""
-    rows = list(zip(tiles[::2], tiles[1::2]))
+    rows = list(zip(tiles[::2], tiles[1::2], strict=True))
     page = Image.new("RGB", (rows[0][0].width + rows[0][1].width, sum(left.height for left, _ in rows)))
     y = 0
     for left, right in rows:
@@ -88,19 +93,20 @@ def stitch(tiles):
 
 
 def crop(page):
-    """Cut the blank border (the colour of the top-left pixel), keeping MARGIN px."""
-    bg = Image.new(page.mode, page.size, page.getpixel((0, 0)))
-    box = ImageChops.difference(page, bg).convert("L").point(lambda v: 255 if v > 32 else 0).getbbox()
+    """Cut the blank border (the colour of the top-left pixel), keeping MARGIN px or slightly more."""
+    small = page.reduce(CROP_SCALE)
+    bg = Image.new(small.mode, small.size, page.getpixel((0, 0)))
+    box = ImageChops.difference(small, bg).convert("L").point(lambda v: 255 if v > 32 else 0).getbbox()
     if not box:
         return page
-    left, top, right, bottom = box
+    left, top, right, bottom = (v * CROP_SCALE for v in box)
     return page.crop((max(left - MARGIN, 0), max(top - MARGIN, 0),
                       min(right + MARGIN, page.width), min(bottom + MARGIN, page.height)))
 
 
-def page_jpeg(s, page, tiledir):
-    tiles = [tile(s, f"{CDN}{page['splitted']}/{i}.gif", tiledir / f"{page['secret']}_{i}.gif")
-             for i in range(TILES)]
+def page_jpeg(tile_paths):
+    """A page from its cached tiles, as JPEG bytes."""
+    tiles = [Image.open(io.BytesIO(p.read_bytes())) for p in tile_paths]  # no open handle blocks the cleanup
     buf = io.BytesIO()
     crop(stitch(tiles)).save(buf, "JPEG", quality=JPEG_QUALITY, dpi=(DPI, DPI))
     return buf.getvalue()
@@ -123,8 +129,18 @@ def main():
 
     tiledir = DATA / "download" / f"{day:%Y%m%d}_{index['edition']['code']}"
     tiledir.mkdir(parents=True, exist_ok=True)
-    with ThreadPoolExecutor(WORKERS) as pool:
-        jpegs = list(tqdm(pool.map(lambda p: page_jpeg(s, p, tiledir), pages), total=len(pages), unit="page"))
+    paths = [[tiledir / f"{p['secret']}_{i}.gif" for i in range(TILES)] for p in pages]
+    # All tiles are queued at once, in page order; each page is built as soon as its tiles are in
+    with ThreadPoolExecutor(DOWNLOAD_THREADS) as dl, ThreadPoolExecutor(PAGE_THREADS) as cpu:
+        fetched = [[dl.submit(fetch, s, f"{CDN}{p['splitted']}/{i}.gif", path) for i, path in enumerate(pp)]
+                   for p, pp in zip(pages, paths, strict=True)]
+
+        def build(n):
+            for f in fetched[n]:
+                f.result()  # re-raises a failed download
+            return page_jpeg(paths[n])
+
+        jpegs = list(tqdm(cpu.map(build, range(len(pages))), total=len(pages), unit="page"))
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.with_suffix(".part").write_bytes(img2pdf.convert(jpegs))

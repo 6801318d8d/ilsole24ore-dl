@@ -23,6 +23,8 @@ assert page.getpixel((45, 55)) == (0, 0, 0) and page.getpixel((0, 0)) == BG
 
 box = (40, 30, 110, 60)  # ink bounding box, right/bottom exclusive
 cropped = m.crop(page)
-assert cropped.size == (box[2] - box[0] + 2 * m.MARGIN, box[3] - box[1] + 2 * m.MARGIN), cropped.size
+exact = (box[2] - box[0] + 2 * m.MARGIN, box[3] - box[1] + 2 * m.MARGIN)  # border measured to CROP_SCALE px
+assert all(0 <= c - e < 2 * m.CROP_SCALE for c, e in zip(cropped.size, exact, strict=True)), (cropped.size, exact)
+assert cropped.convert("L").histogram()[0] == page.convert("L").histogram()[0]  # no ink cut
 assert m.crop(Image.new("RGB", (10, 10), BG)).size == (10, 10)  # blank page: unchanged
 print("ok")
