@@ -2,6 +2,7 @@
 
     python src/ilsole24ore_dl.py              latest issue
     python src/ilsole24ore_dl.py 2026-11-16   issue of that date
+    python src/ilsole24ore_dl.py --keep-days 7   first delete the issues downloaded over 7 days ago
 
 The viewer's issue index (get_timone.php) lists the pages; each page is served as
 8 GIF tiles (2 columns x 4 rows). All tiles are downloaded at once (cached in
@@ -50,7 +51,7 @@ def session():
 def issue_index(s, day, edition):
     """The index of an issue, or None when that edition of that day does not exist."""
     params = {"newspaper": "S24", "issue": f"{day:%Y%m%d}", "edition": edition, "issue_date": ""}
-    r = s.get(INDEX_URL, params=params, timeout=30)
+    r = s.get(INDEX_URL, params=params, timeout=(10, 30))  # (connect, read): an unreachable host fails fast
     r.raise_for_status()
     j = r.json()
     return j["result"]["data"] if j["status"] == "OK" else None
@@ -71,7 +72,7 @@ def fetch(s, url, path):
     """Download a tile, unless it is already cached."""
     if path.is_file():
         return
-    r = s.get(url, timeout=60)
+    r = s.get(url, timeout=(10, 60))
     r.raise_for_status()
     if not r.content.startswith(b"GIF"):
         raise RuntimeError(f"not a GIF: {url}")
@@ -112,10 +113,27 @@ def page_jpeg(tile_paths):
     return buf.getvalue()
 
 
+def prune(keep_days):
+    """Delete the issue PDFs, and the tile folders of failed runs, last modified over KEEP_DAYS days ago."""
+    oldest = dt.date.today() - dt.timedelta(days=keep_days)
+    for p in [*(DATA / "final").glob("IlSole24Ore_*.pdf"), *(DATA / "download").glob("*_*")]:
+        if dt.date.fromtimestamp(p.stat().st_mtime) < oldest:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink()
+            print(f"Deleted {p}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Download an issue of Il Sole 24 Ore as a PDF.")
     ap.add_argument("date", nargs="?", type=dt.date.fromisoformat, help="YYYY-MM-DD (default: the latest issue)")
-    day = ap.parse_args().date
+    ap.add_argument("--keep-days", type=int, metavar="N",
+                    help="first delete the issues (and leftover tiles) last modified over N days ago")
+    args = ap.parse_args()
+    if args.keep_days is not None:
+        prune(args.keep_days)
+    day = args.date
 
     s = session()
     print("Looking for the issue...", flush=True)
@@ -145,7 +163,7 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     out.with_suffix(".part").write_bytes(img2pdf.convert(jpegs))
     out.with_suffix(".part").replace(out)
-    shutil.rmtree(tiledir)
+    shutil.rmtree(tiledir, ignore_errors=True)  # a file held open (antivirus) must not fail a saved issue
     print(f"Saved {out} ({out.stat().st_size / 1e6:,.0f} MB)")
 
 
