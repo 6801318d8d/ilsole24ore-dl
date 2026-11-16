@@ -158,7 +158,11 @@ def main():
                 f.result()  # re-raises a failed download
             return page_jpeg(paths[n])
 
-        jpegs = list(tqdm(cpu.map(build, range(len(pages))), total=len(pages), unit="page"))
+        try:
+            jpegs = list(tqdm(cpu.map(build, range(len(pages))), total=len(pages), unit="page"))
+        except BaseException:  # a failed tile or Ctrl+C: drop the queued downloads instead of waiting for them
+            dl.shutdown(cancel_futures=True)
+            raise
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.with_suffix(".part").write_bytes(img2pdf.convert(jpegs))

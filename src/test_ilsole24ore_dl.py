@@ -4,6 +4,7 @@ import datetime as dt
 import os
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -74,4 +75,24 @@ for day, msg in ((None, "No issue found for 2026-11-08 to 2026-11-16"), (dt.date
         raise AssertionError("no SystemExit")
     except SystemExit as e:
         assert str(e) == msg, e
+
+# main: a failed tile stops the run at once, without downloading the rest of the queue
+def fake_fetch(s, url, path):
+    started.append(url)
+    if url.endswith("p0/0.gif"):
+        raise RuntimeError("tile missing")
+    time.sleep(0.2)
+
+
+pages = [{"page": n, "secret": f"s{n}", "splitted": f"p{n}"} for n in range(40)]  # 320 tiles
+index = {"pages": pages, "edition": {"description": "E", "code": "SOLE"}, "issue": {"description": "I"}}
+m.find_issue, m.fetch, sys.argv, started = (lambda s, day: (dt.date(2026, 11, 15), index)), fake_fetch, ["test"], []
+with tempfile.TemporaryDirectory() as tmp:
+    m.DATA = Path(tmp)
+    try:
+        m.main()
+        raise AssertionError("no error")
+    except RuntimeError as e:
+        assert str(e) == "tile missing", e
+assert len(started) < 2 * m.DOWNLOAD_THREADS, len(started)
 print("ok")
