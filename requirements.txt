@@ -1,5 +1,0 @@
-selenium
-pandas
-tqdm
-python-gnupg
-keepassxc_proxy_client

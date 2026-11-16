@@ -1,0 +1,13 @@
+[project]
+name = "ilsole24ore-dl"
+version = "0.1.0"
+description = "Download Il Sole 24 Ore issues as PDF"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "img2pdf>=0.6.3",
+    "pillow>=13.0.0",
+    "requests>=2.34.2",
+    "tqdm>=4.70.1",
+]
+
