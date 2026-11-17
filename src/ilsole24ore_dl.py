@@ -3,6 +3,7 @@
     python src/ilsole24ore_dl.py              latest issue
     python src/ilsole24ore_dl.py 2026-11-16   issue of that date
     python src/ilsole24ore_dl.py --keep-days 7   first delete the issues downloaded over 7 days ago
+    python src/ilsole24ore_dl.py --outdir DIR    save the issues in DIR (default: data/final)
 
 The viewer's issue index (get_timone.php) lists the pages; each page is served as
 8 GIF tiles (2 columns x 4 rows). All tiles are downloaded at once (cached in
@@ -113,10 +114,10 @@ def page_jpeg(tile_paths):
     return buf.getvalue()
 
 
-def prune(keep_days):
-    """Delete the issue PDFs, and the tile folders of failed runs, last modified over KEEP_DAYS days ago."""
+def prune(keep_days, outdir):
+    """Delete the issue PDFs in OUTDIR, and the tile folders of failed runs, last modified over KEEP_DAYS days ago."""
     oldest = dt.date.today() - dt.timedelta(days=keep_days)
-    for p in [*(DATA / "final").glob("IlSole24Ore_*.pdf"), *(DATA / "download").glob("*_*")]:
+    for p in [*outdir.glob("IlSole24Ore_*.pdf"), *(DATA / "download").glob("*_*")]:
         if dt.date.fromtimestamp(p.stat().st_mtime) < oldest:
             if p.is_dir():
                 shutil.rmtree(p, ignore_errors=True)
@@ -130,15 +131,17 @@ def main():
     ap.add_argument("date", nargs="?", type=dt.date.fromisoformat, help="YYYY-MM-DD (default: the latest issue)")
     ap.add_argument("--keep-days", type=int, metavar="N",
                     help="first delete the issues (and leftover tiles) last modified over N days ago")
+    ap.add_argument("--outdir", type=Path, default=DATA / "final", metavar="DIR",
+                    help="folder of the issue PDFs (default: data/final)")
     args = ap.parse_args()
     if args.keep_days is not None:
-        prune(args.keep_days)
+        prune(args.keep_days, args.outdir)
     day = args.date
 
     s = session()
     print("Looking for the issue...", flush=True)
     day, index = find_issue(s, day)
-    out = DATA / "final" / f"IlSole24Ore_{day:%Y-%m-%d}.pdf"
+    out = args.outdir / f"IlSole24Ore_{day:%Y-%m-%d}.pdf"
     if out.is_file():
         print(f"Already downloaded: {out}")
         return
