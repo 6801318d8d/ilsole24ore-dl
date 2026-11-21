@@ -15,7 +15,7 @@ Daily download: `powershell -ExecutionPolicy Bypass -File register_daily_task.ps
 
 | `--mode` | What you get | Login | Time and size (32 pages) |
 |---|---|---|---|
-| `full` (default) | the publisher's PDF of the whole edition: vector text you can search and copy, embedded fonts, pictures at 150 dpi; every page carries a line with the institutional account and a code | institutional (Shibboleth) login, from `.env` | about 8 s, 34 MB |
+| `full` (default) | the publisher's PDF of the whole edition: vector text you can search and copy, embedded fonts, pictures at 150 dpi; without the marks that identify the subscriber (see below) | institutional (Shibboleth) login, from `.env` | about 8 s, 34 MB |
 | `pages` | the PDF the viewer serves for each page, merged: one 200 dpi image per page, no text | none | about 7 s, 75 MB |
 | `tiles` | the page images, 8 tiles per page, stitched at full resolution, cropped to the printed area and merged without re-encoding | none | about 50 MB |
 
@@ -28,6 +28,15 @@ Login for `full`: copy `.env.example` to `.env` and fill it in. `.env` is in `.g
 - `SOLE_USERNAME`, `SOLE_PASSWORD`: your institutional credentials.
 
 The script logs in like a browser: it picks the institution, fills the identity provider's login form, accepts the release of the attributes to the publisher, and posts the answer back to the publisher's site, which opens the session; then it asks for the whole edition, as the viewer's "save" button does, and extracts the PDF from the ZIP the server sends.
+
+The server marks that PDF with the subscriber, and the script removes the marks before saving it (`scrub()`):
+
+- at the top of each page (except full-page ads), a grey line with the institutional account and the first 16 characters of a download code (64 hex digits, the same for each account and issue);
+- below it, the whole code in black, hidden under a paper-coloured box that also covers a few words of the newspaper on the front page;
+- the code in the PDF's Subject and in the Exif description of a few pictures;
+- the download time and pdf-lib as producer in the PDF's metadata.
+
+Nothing else on the pages changes. If the PDF carries a code but no watermark of the known form, the mode fails and falls back to `pages`. Marks hidden in the pixels of the pictures cannot be ruled out. `pages`, `tiles` and the articles carry no such marks: the server sends the same files with and without a login.
 
 The server has the PDF of the whole edition for issues from 2023 on (checked: 2023-06-15 yes, 2022-06-15 no); for older issues, and for supplements without one (e.g. `EBOOK`), it sends a one-page placeholder and `full` falls back to `pages`. The page PDFs of `EBOOK` are encrypted, so it ends in `tiles`.
 
@@ -46,7 +55,7 @@ Next to each PDF the script saves, with no login:
 
 If the articles cannot be saved, the run only warns and keeps the PDF.
 
-`python src/test_ilsole24ore_dl.py` checks offline the stitching, the cropping, the cleanup, the choice of the issue and of the edition, the reading of the newsstand page, the merging of the page PDFs, the extraction of the full PDF, the fallback from one mode to the next, and the conversion of the articles to Markdown.
+`python src/test_ilsole24ore_dl.py` checks offline the stitching, the cropping, the cleanup, the choice of the issue and of the edition, the reading of the newsstand page, the merging of the page PDFs, the extraction of the full PDF and the removal of its marks, the fallback from one mode to the next, and the conversion of the articles to Markdown.
 
 ## Show the viewer's PDF save button
 

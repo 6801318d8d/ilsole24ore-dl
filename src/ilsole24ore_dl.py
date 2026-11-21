@@ -13,7 +13,8 @@ text of every article and a search index) and the articles as Markdown (.md).
 The viewer's issue index (get_timone.php) lists the pages. The issue is saved as
 data/final/IlSole24Ore_<date>.pdf in one of three modes; a mode that fails falls back to the next:
 - full: the publisher's PDF of the whole edition (vector text), after the institutional
-  Shibboleth login set in .env (SOLE_LOGIN_URL, SOLE_IDP, SOLE_USERNAME, SOLE_PASSWORD);
+  Shibboleth login set in .env (SOLE_LOGIN_URL, SOLE_IDP, SOLE_USERNAME, SOLE_PASSWORD), without
+  the watermark, the download code and the metadata that identify the subscriber (scrub());
 - pages: the PDF of each page (one 200 dpi JPEG, no text layer), no login;
 - tiles: 8 GIF tiles per page (2 columns x 4 rows), stitched at full resolution, cropped to
   the printed area, JPEG-encoded and merged without re-encoding; no login.
@@ -38,7 +39,7 @@ from urllib.parse import parse_qs, quote, urljoin, urlparse
 import img2pdf
 import requests
 from PIL import Image, ImageChops
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
 from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 from urllib3.util.retry import Retry
@@ -47,6 +48,7 @@ INDEX_URL = "https://www.quotidiano.ilsole24ore.com/sfoglio/_resources/php/get_t
 PDF_URL = "https://www.quotidiano.ilsole24ore.com/sfoglio/_resources/php/get_pdf.php"  # the viewer's "save the whole issue"
 NEWSSTAND_URL = "https://www.quotidiano.ilsole24ore.com/"  # lists the newspaper's editions and supplements
 DAILY = ("SOLE", "LUNEDI")  # the daily newspaper, saved as IlSole24Ore_<date>.pdf; other editions get _<EDITION>
+WATERMARK = b"@ Gruppo Il Sole 24 ORE".hex().upper().encode()  # its text as pdf-lib writes it: a hex string
 CDN = "https://mobapp2.ilsole24ore.com/_deploy/"
 TILES = 8  # per page, 2 columns x 4 rows
 LOOKBACK_DAYS = 7  # latest issue: from tomorrow (published the evening before) back this many days
@@ -231,7 +233,32 @@ def full_issue(s, index, folder):
         pdfs = [n for n in z.namelist() if n.lower().endswith(".pdf")]
         if len(pdfs) != 1:
             raise RuntimeError(f"expected one PDF in the ZIP, found {z.namelist()}")
-        return z.read(pdfs[0])
+        return scrub(z.read(pdfs[0]))
+
+
+def scrub(pdf):
+    """The publisher's PDF without what identifies the subscriber: the watermark the server adds to each page with
+    pdf-lib (a line with the institutional account and the download code, then the whole code in black under a
+    paper-coloured box), the code in the Subject and in the Exif of a few pictures, and the download time."""
+    r = PdfReader(io.BytesIO(pdf))
+    code = str((r.metadata or {}).get("/Subject", "")).encode()  # 64 hex digits, the same for each account and issue
+    w = PdfWriter(clone_from=r)
+    w.metadata = None  # Subject, creation and modification time, producer
+    stamped = 0
+    for page in (p for p in w.pages if "/Contents" in p):  # a blank page may have none
+        parts = page["/Contents"].get_object()
+        parts = [p.get_object() for p in parts] if isinstance(parts, list) else [parts]
+        for part in parts:
+            if WATERMARK in part.get_data():
+                if len(parts) == 1:  # pdf-lib appends its own stream: a single one is the page itself
+                    raise RuntimeError("watermark inside the page's own content: scrub() would blank the page")
+                part.set_data(b"")
+                stamped += 1
+    if code and not stamped:
+        raise RuntimeError("the PDF carries a download code but no known watermark: its format changed")
+    buf = io.BytesIO()
+    w.write(buf)
+    return buf.getvalue().replace(code, b" " * len(code)) if code else buf.getvalue()  # same length: JPEGs stay valid
 
 
 def pdf_issue(s, index, folder):

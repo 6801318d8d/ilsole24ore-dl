@@ -13,6 +13,13 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import (
+    ArrayObject,
+    DecodedStreamObject,
+    DictionaryObject,
+    NameObject,
+    NumberObject,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ilsole24ore_dl as m  # noqa: E402
@@ -181,17 +188,70 @@ class FakeResponse:
         yield self.body
 
 
+# scrub: the server's PDF as pdf-lib leaves it: [q, page, Q, watermark] contents, the code in the Subject and in a
+# JPEG's Exif; a full-page ad keeps its single stream
+CODE = "0123456789ABCDEF" * 4
+
+
+def stamped_pdf(code=CODE, watermark=True):
+    w = PdfWriter()
+    for _ in range(2):
+        w.add_blank_page(100, 100)
+    exif = Image.Exif()
+    exif[0x010E] = code or "picture"  # ImageDescription
+    jpeg = io.BytesIO()
+    Image.new("RGB", (8, 8), "red").save(jpeg, "JPEG", exif=exif)
+    img = DecodedStreamObject()
+    img.set_data(jpeg.getvalue())
+    img.update({NameObject(k): v for k, v in {"/Type": NameObject("/XObject"), "/Subtype": NameObject("/Image"),
+                "/Width": NumberObject(8), "/Height": NumberObject(8), "/ColorSpace": NameObject("/DeviceRGB"),
+                "/BitsPerComponent": NumberObject(8), "/Filter": NameObject("/DCTDecode")}.items()})
+    texts = [b"q", b"BT (news) Tj ET q 8 0 0 8 0 0 cm /Im0 Do Q", b"Q"]
+    if watermark:
+        line = f"account_x @ Gruppo Il Sole 24 ORE RIPRODUZIONE RISERVATA {code[:16]}".encode().hex().upper()
+        texts.append(f"BT <{line}> Tj ET BT <{code.encode().hex().upper()}> Tj ET".encode())
+    parts = ArrayObject()
+    for text in texts:
+        s = DecodedStreamObject()
+        s.set_data(text)
+        parts.append(w._add_object(s))
+    page = w.pages[0]
+    page[NameObject("/Contents")] = parts
+    page[NameObject("/Resources")] = DictionaryObject({NameObject("/XObject"): DictionaryObject(
+        {NameObject("/Im0"): w._add_object(img)})})
+    w.add_metadata({"/Subject": code, "/CreationDate": "D:20261121154526Z"})
+    buf = io.BytesIO()
+    w.write(buf)
+    return buf.getvalue()
+
+
+clean = m.scrub(stamped_pdf())
+assert CODE.encode() not in clean and CODE[:16].encode().hex().upper().encode() not in clean
+r = PdfReader(io.BytesIO(clean))
+assert not r.metadata and len(r.pages) == 2, r.metadata
+content = b"".join(p.get_object().get_data() for p in r.pages[0]["/Contents"])
+assert b"(news)" in content and m.WATERMARK not in content, content
+jpeg = r.pages[0]["/Resources"]["/XObject"]["/Im0"].get_object().get_data()
+assert Image.open(io.BytesIO(jpeg)).getpixel((4, 4))[0] > 200  # the picture still decodes
+assert not PdfReader(io.BytesIO(m.scrub(stamped_pdf("", watermark=False)))).metadata  # no watermark: only metadata
+try:
+    m.scrub(stamped_pdf(watermark=False))
+    raise AssertionError("a code without its known watermark must raise")
+except RuntimeError as e:
+    assert "no known watermark" in str(e), e
+
 zbuf = io.BytesIO()
 with zipfile.ZipFile(zbuf, "w") as z:
-    z.writestr("S24-20261115-SOLE.pdf", b"%PDF-1.7 whole")
+    z.writestr("S24-20261115-SOLE.pdf", stamped_pdf())
 full_index = {"newspaper": {"code": "S24"}, "edition": {"code": "SOLE", "id": 1}, "issue": {"code": "20261115"}, "version": 1}
 m.sso_login = lambda s: None
-for body, expected in ((zbuf.getvalue(), b"%PDF-1.7 whole"), (b"DOWNLOAD_KO_USER_INVALID", None)):
+for body, ok in ((zbuf.getvalue(), True), (b"DOWNLOAD_KO_USER_INVALID", False)):
     fake = types.SimpleNamespace(post=lambda url, **kw: FakeResponse(body))
     try:
-        assert m.full_issue(fake, full_index, None) == expected
+        pdf = m.full_issue(fake, full_index, None)
+        assert ok and pdf.startswith(b"%PDF") and CODE.encode() not in pdf  # the PDF in the ZIP, scrubbed
     except RuntimeError as e:
-        assert expected is None and "no ZIP" in str(e), e
+        assert not ok and "no ZIP" in str(e), e
 
 # FirstForm: only the first form, without checkboxes and buttons
 form = m.FirstForm('<form action="/a"><input type="hidden" name="h" value="1"><input name="t">'
