@@ -3,6 +3,7 @@
 import datetime as dt
 import io
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -44,6 +45,7 @@ def noon(days_ago):
 with tempfile.TemporaryDirectory() as tmp:
     m.DATA = Path(tmp)
     files = {"final/IlSole24Ore_2026-11-01.pdf": (8, False), "final/IlSole24Ore_2026-11-02.pdf": (7, True),
+             "final/IlSole24Ore_2026-11-01_PLUS.db": (8, False), "final/IlSole24Ore_2026-11-01.md": (8, False),
              "final/notes.pdf": (30, True), "download/20261101_SOLE/x_0.gif": (8, True)}
     for name, (age, _) in files.items():
         (m.DATA / name).parent.mkdir(parents=True, exist_ok=True)
@@ -55,6 +57,37 @@ with tempfile.TemporaryDirectory() as tmp:
     for name, (_age, kept) in files.items():
         if not name.startswith("download/"):
             assert (m.DATA / name).exists() == kept, name
+
+# html_to_md: paragraphs, bold, line breaks, tables; other tags dropped, entities decoded
+md = m.html_to_md('<p>Dal nostro <b>corrispondente</b></p><p><citta>NEW YORK</citta><br/>l&#8217;ha</p>'
+                  '<table><tr><td><b>Cat.</b></td><td>Fondi</td></tr><tr><td>FLE</td><td>A | B</td></tr></table>')
+assert md == "Dal nostro **corrispondente**\n\nNEW YORK\nl’ha\n\n| Cat. | Fondi |\n| --- | --- |\n| FLE | A \\| B |", md
+
+# articles_markdown: page order, sections as headings, empty fields left out
+with tempfile.TemporaryDirectory() as tmp:
+    db = Path(tmp) / "a.db"
+    con = sqlite3.connect(db)
+    con.executescript("""
+        CREATE TABLE section (id, name, priority); CREATE TABLE article (id, section_id, priority);
+        CREATE TABLE article2firstpage (article_id, first_page);
+        CREATE TABLE article_fts (article_id, headline, subhead, subheading, abstract, text, signature, caption, page);
+        INSERT INTO section VALUES (1, 'PRIMA PAGINA', 1), (2, 'COMMENTI', 2);
+        INSERT INTO article VALUES (10, 2, 1), (11, 1, 2), (12, 1, 1);
+        INSERT INTO article2firstpage VALUES (10, 6), (11, 1), (12, 1);
+        INSERT INTO article_fts VALUES (10, 'Il commento', '', '', '', '<p>Testo.</p>', 'Mario Rossi', '', 6),
+            (11, 'Secondo', '', '', '', '<p>B</p>', '', '', 1), (12, 'Primo', 'Occhiello', '', 'Sommario', '<p>A</p>', '', '', 1);
+    """)
+    con.commit()
+    con.close()
+    assert m.articles_markdown(db, "Il Sole 24 Ore, 1 novembre 2026") == (
+        "# Il Sole 24 Ore, 1 novembre 2026\n\n## PRIMA PAGINA\n\n### Primo\n\n*Occhiello*\n\n**Sommario**\n\nA\n\npagina 1"
+        "\n\n### Secondo\n\nB\n\npagina 1\n\n## COMMENTI\n\n### Il commento\n\nTesto.\n\nMario Rossi · pagina 6\n")
+
+# newsstand: the editions and issue dates of the newsstand page, whatever the order of the attributes
+page = ('<img data-edizione="PLUS" data-issue="20261114" data-testata="S24"><span data-testata="S24" '
+        'data-issue="20261107" data-edizione="PLUS">Sfoglia</span><span data-edizione="SOLE" data-issue="20261120">')
+assert m.newsstand(types.SimpleNamespace(get=lambda url, **kw: types.SimpleNamespace(text=page))) == {
+    "PLUS": [dt.date(2026, 11, 7), dt.date(2026, 11, 14)], "SOLE": [dt.date(2026, 11, 20)]}
 
 # find_issue: from tomorrow backwards, Monday's edition first on Mondays, one clear message on failure
 m.dt = types.SimpleNamespace(date=type("Today", (dt.date,), {"today": classmethod(lambda c: dt.date(2026, 11, 15))}),
@@ -71,6 +104,10 @@ m.issue_index = fake_index
 assert m.find_issue(None) == (dt.date(2026, 11, 14), {"pages": []})
 assert calls == [("2026-11-16", "LUNEDI"), ("2026-11-16", "SOLE"), ("2026-11-15", "SOLE"), ("2026-11-15", "LUNEDI"),
                  ("2026-11-14", "SOLE")], calls
+calls.clear()  # one edition only: the daily newspaper is not tried
+m.issue_index = lambda s, d, edition: fake_index(s, d, edition, found=(dt.date(2026, 11, 14), "PLUS"))
+assert m.find_issue(None, dt.date(2026, 11, 14), ("PLUS",)) == (dt.date(2026, 11, 14), {"pages": []})
+assert calls == [("2026-11-14", "PLUS")], calls
 m.issue_index = lambda s, d, edition: None
 for day, msg in ((None, "No issue found for 2026-11-08 to 2026-11-16"), (dt.date(2026, 11, 10), "No issue found for 2026-11-10")):
     try:

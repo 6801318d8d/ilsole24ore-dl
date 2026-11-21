@@ -5,7 +5,7 @@ download_latest_issue.bat              # the latest issue
 download_latest_issue.bat 2026-11-16   # the issue of a given date
 ```
 
-or `uv run python src/ilsole24ore_dl.py [YYYY-MM-DD] [--mode full|pages|tiles]` (see "Modes"). The PDF is saved as `data/final/IlSole24Ore_<date>.pdf` (another folder with `--outdir DIR`); an issue already downloaded is skipped. `--keep-days N` first deletes the issues in that folder (and the tiles of failed runs) last modified over N days ago.
+or `uv run python src/ilsole24ore_dl.py [YYYY-MM-DD] [--mode full|pages|tiles] [--edition CODE|all]` (see "Modes" and "Editions and supplements"). The PDF is saved as `data/final/IlSole24Ore_<date>.pdf` (another folder with `--outdir DIR`), with the articles next to it (see "Articles"); an issue already downloaded is skipped. `--keep-days N` first deletes the issues in that folder (PDF, `.db` and `.md`, and the tiles of failed runs) last modified over N days ago.
 
 Daily download: `powershell -ExecutionPolicy Bypass -File register_daily_task.ps1` registers a Windows scheduled task that every day at 07:00 (or as soon as the PC is back on, once a network is up, also on battery) deletes the issues downloaded over 7 days ago and downloads the latest one; its output goes to `data/download_latest_issue.log`.
 
@@ -29,7 +29,24 @@ Login for `full`: copy `.env.example` to `.env` and fill it in. `.env` is in `.g
 
 The script logs in like a browser: it picks the institution, fills the identity provider's login form, accepts the release of the attributes to the publisher, and posts the answer back to the publisher's site, which opens the session; then it asks for the whole edition, as the viewer's "save" button does, and extracts the PDF from the ZIP the server sends.
 
-`python src/test_ilsole24ore_dl.py` checks offline the stitching, the cropping, the cleanup, the choice of the issue, the merging of the page PDFs, the extraction of the full PDF and the fallback from one mode to the next.
+The server has the PDF of the whole edition for issues from 2023 on (checked: 2023-06-15 yes, 2022-06-15 no); for older issues, and for supplements without one (e.g. `EBOOK`), it sends a one-page placeholder and `full` falls back to `pages`. The page PDFs of `EBOOK` are encrypted, so it ends in `tiles`.
+
+## Editions and supplements
+
+`--list-editions` lists the editions and supplements of the last weeks, from the site's newsstand page: `SOLE` (the daily, `LUNEDI` on Mondays), `DOMENICA`, `PLUS` (Plus24), `RAPPORTO`, `HOWTOSPENDIT`, `ULTIMAPAGINA`, the regional ones (`RCENTRO`, `RLOMBARDIA`, `RNORDEST`, `RNORDOVEST`, `RSUD`) and others. `--edition PLUS` downloads that edition (without a date: its latest issue, also when it is weekly or monthly); `--edition all` downloads every edition of that date (default: the latest issue of the daily). The daily is saved as `IlSole24Ore_<date>.pdf`, the other editions as `IlSole24Ore_<date>_<EDITION>.pdf`.
+
+Archive: issues are found from about 2014 on. The site lists 2012 and 2013 issues only as archive PDFs that it no longer serves (404), and finds none for 2010 and 2011.
+
+## Articles
+
+Next to each PDF the script saves, with no login:
+
+- `IlSole24Ore_<date>.db`: the viewer's own database of the issue (SQLite, about 3.5 MB for 32 pages), with the full text of every article (headline, subhead, abstract, text, signature, captions, page, section) and a full-text index (`article_fts`). For example, `SELECT page, headline FROM article_fts WHERE article_fts MATCH 'inflazione'`;
+- `IlSole24Ore_<date>.md`: the same articles as Markdown, in page order under their sections, with the tables as Markdown tables (about 130,000 words for 32 pages). Editions made only of pictures (e.g. `ULTIMAPAGINA`) have no articles.
+
+If the articles cannot be saved, the run only warns and keeps the PDF.
+
+`python src/test_ilsole24ore_dl.py` checks offline the stitching, the cropping, the cleanup, the choice of the issue and of the edition, the reading of the newsstand page, the merging of the page PDFs, the extraction of the full PDF, the fallback from one mode to the next, and the conversion of the articles to Markdown.
 
 ## Show the viewer's PDF save button
 

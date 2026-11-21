@@ -5,6 +5,10 @@
     python src/ilsole24ore_dl.py --keep-days 7   first delete the issues downloaded over 7 days ago
     python src/ilsole24ore_dl.py --outdir DIR    save the issues in DIR (default: data/final)
     python src/ilsole24ore_dl.py --mode pages    how to get the issue: full (default), pages or tiles
+    python src/ilsole24ore_dl.py --edition PLUS  a supplement (--list-editions shows the codes; 'all': every edition)
+
+Next to each PDF the articles are saved too: the viewer's database (.db, SQLite with the full
+text of every article and a search index) and the articles as Markdown (.md).
 
 The viewer's issue index (get_timone.php) lists the pages. The issue is saved as
 data/final/IlSole24Ore_<date>.pdf in one of three modes; a mode that fails falls back to the next:
@@ -18,9 +22,12 @@ Pages and tiles are downloaded at once and cached in data/download/, so an inter
 
 import argparse
 import datetime as dt
+import html
 import io
 import os
+import re
 import shutil
+import sqlite3
 import sys
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,6 +45,8 @@ from urllib3.util.retry import Retry
 
 INDEX_URL = "https://www.quotidiano.ilsole24ore.com/sfoglio/_resources/php/get_timone.php"
 PDF_URL = "https://www.quotidiano.ilsole24ore.com/sfoglio/_resources/php/get_pdf.php"  # the viewer's "save the whole issue"
+NEWSSTAND_URL = "https://www.quotidiano.ilsole24ore.com/"  # lists the newspaper's editions and supplements
+DAILY = ("SOLE", "LUNEDI")  # the daily newspaper, saved as IlSole24Ore_<date>.pdf; other editions get _<EDITION>
 CDN = "https://mobapp2.ilsole24ore.com/_deploy/"
 TILES = 8  # per page, 2 columns x 4 rows
 LOOKBACK_DAYS = 7  # latest issue: from tomorrow (published the evening before) back this many days
@@ -75,18 +84,33 @@ def issue_index(s, day, edition):
     r = s.get(INDEX_URL, params=params, timeout=(10, 30))  # (connect, read): an unreachable host fails fast
     r.raise_for_status()
     j = r.json()
-    return j["result"]["data"] if j["status"] == "OK" else None
+    if j["result"].get("code") == "PDF_AVAILABLE":  # 2012-2013: an archive PDF that the site no longer serves (404)
+        print(f"{day} {edition}: listed only as an archive PDF, which the site no longer serves")
+    return j["result"]["data"] if j["status"] == "OK" and "pages" in (j["result"]["data"] or {}) else None
 
 
-def find_issue(s, day=None):
-    """(date, index) of the issue of DAY or, without DAY, of the latest issue.
+def find_issue(s, day=None, editions=None):
+    """(date, index) of the issue of DAY or, without DAY, of the latest issue, in the first of EDITIONS that has
+    one (default: the daily newspaper, whose Monday edition is LUNEDI).
     Sequential on one kept-alive connection: 18 parallel requests took 1.1 s, 4 in a row 0.3 s."""
     days = [day] if day else [dt.date.today() + dt.timedelta(days=1 - k) for k in range(LOOKBACK_DAYS + 2)]
     for d in days:
-        for edition in ("LUNEDI", "SOLE") if d.weekday() == 0 else ("SOLE", "LUNEDI"):  # likely one first
+        for edition in editions or (("LUNEDI", "SOLE") if d.weekday() == 0 else ("SOLE", "LUNEDI")):  # likely one first
             if index := issue_index(s, d, edition):
                 return d, index
-    sys.exit(f"No issue found for {days[-1]}" + (f" to {days[0]}" if len(days) > 1 else ""))
+    sys.exit(f"No issue found for {days[-1]}" + (f" to {days[0]}" if len(days) > 1 else "")
+             + (f" ({', '.join(editions)})" if editions else ""))
+
+
+def newsstand(s):
+    """{edition: [issue dates]} that the newsstand page lists (supplements included, about the last 40 days)."""
+    html = s.get(NEWSSTAND_URL, timeout=(10, 30)).text
+    found = {}
+    for tag in re.findall(r"<[^>]*data-edizione=[^>]*>", html):
+        edition, issue = re.search(r'data-edizione="([^"]+)"', tag), re.search(r'data-issue="(\d{8})"', tag)
+        if edition and issue:
+            found.setdefault(edition[1], set()).add(dt.datetime.strptime(issue[1], "%Y%m%d").date())
+    return {e: sorted(d) for e, d in found.items()}
 
 
 def fetch(s, url, path, magic=b"GIF"):
@@ -155,8 +179,10 @@ class FirstForm(HTMLParser):
 
 
 def sso_login(s):
-    """Log session S in through the institutional Shibboleth login set in .env."""
-    cfg = {k: os.environ.get(f"SOLE_{k}") for k in ("LOGIN_URL", "IDP", "USERNAME", "PASSWORD")}
+    """Log session S in through the institutional Shibboleth login set in .env (once per session)."""
+    if "SoleAuth" in s.cookies:
+        return
+    cfg ={k: os.environ.get(f"SOLE_{k}") for k in ("LOGIN_URL", "IDP", "USERNAME", "PASSWORD")}
     if missing := [f"SOLE_{k}" for k, v in cfg.items() if not v]:
         raise RuntimeError(f"missing in .env: {', '.join(missing)}")
     r = s.get(cfg["LOGIN_URL"], timeout=(10, 30))  # ends on the federation's page that picks the institution
@@ -197,6 +223,8 @@ def full_issue(s, index, folder):
                 buf.write(chunk)
                 bar.update(len(chunk))
     body = buf.getvalue()
+    if body.startswith(b"%PDF"):  # an 844-byte one-page placeholder (EBOOK; issues of 2022 and earlier)
+        raise RuntimeError("no PDF of the whole edition on the server (it sent a one-page placeholder)")
     if not body.startswith(b"PK"):  # the server answers e.g. DOWNLOAD_KO_USER_INVALID
         raise RuntimeError(f"no ZIP from the server: {body[:60]!r}")
     with zipfile.ZipFile(io.BytesIO(body)) as z:
@@ -249,6 +277,77 @@ def tile_issue(s, index, folder):
     return img2pdf.convert(jpegs)
 
 
+def table_md(table):
+    """An HTML table as a Markdown table (cell text only; the first row is the header)."""
+    rows = [[re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", cell))).strip().replace("|", "\\|")
+             for cell in re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", tr, flags=re.S | re.I)]
+            for tr in re.findall(r"<tr\b.*?</tr>", table, flags=re.S | re.I)]
+    rows = [r for r in rows if any(r)]
+    if not rows:
+        return ""
+    width = max(map(len, rows))
+    lines = ["| " + " | ".join(r + [""] * (width - len(r))) + " |" for r in rows]
+    return "\n".join([lines[0], "|" + " --- |" * width, *lines[1:]])
+
+
+def html_to_md(text):
+    """The publisher's article HTML as Markdown: paragraphs, line breaks, bold, italics and tables; other tags dropped."""
+    text = re.sub(r"<table\b.*?</table>", lambda m: "\n\n" + table_md(m[0]) + "\n\n", text or "", flags=re.S | re.I)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</p\s*>", "\n\n", text, flags=re.I)
+    text = re.sub(r"</?b>", "**", text, flags=re.I)
+    text = re.sub(r"</?i>", "*", text, flags=re.I)
+    text = html.unescape(re.sub(r"<[^>]+>", "", text))  # <p>, <firma>, <citta>, <fonte> ...
+    text = re.sub(r" *\n *", "\n", re.sub(r"[ \t]+", " ", text))
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def articles_markdown(db, title):
+    """The articles of the viewer's issue database DB as one Markdown document, in page order, under their sections."""
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            "SELECT s.name, f.page, f.headline, f.subhead, f.subheading, f.abstract, f.text, f.signature, f.caption"
+            " FROM article a JOIN article_fts f ON f.article_id = a.id"
+            " LEFT JOIN section s ON s.id = a.section_id"
+            " LEFT JOIN article2firstpage p ON p.article_id = a.id"
+            " ORDER BY COALESCE(p.first_page, f.page), a.priority").fetchall()
+    finally:
+        con.close()  # an open handle would block the file on Windows
+    out, section = [f"# {title}"], None
+    for name, page, headline, subhead, subheading, abstract, text, signature, caption in rows:
+        if name != section:
+            section = name
+            out.append(f"## {name or 'Senza sezione'}")
+        out.append("### " + (html_to_md(headline).replace("\n", " ") or "(senza titolo)"))
+        out += [f"*{x}*" for x in map(html_to_md, (subhead, subheading)) if x]
+        if x := html_to_md(abstract):
+            out.append(f"**{x}**")
+        if x := html_to_md(text):
+            out.append(x)
+        if x := html_to_md(caption):
+            out.append(f"*{x}*")
+        out.append(" · ".join(filter(None, (html_to_md(signature), f"pagina {page}"))))
+    return "\n\n".join(out) + "\n"
+
+
+def save_articles(s, index, out):
+    """Save the articles of the issue next to OUT: the viewer's database (OUT.db: SQLite, full text of every article
+    with a search index) and the articles as Markdown (OUT.md). No login; a failure only warns, the PDF stays."""
+    try:
+        r = s.get(CDN + index["sqLite"], timeout=(10, 120))
+        r.raise_for_status()
+        if not r.content.startswith(b"SQLite format 3"):
+            raise RuntimeError("not an SQLite database")
+        db, md = out.with_suffix(".db"), out.with_suffix(".md")
+        db.write_bytes(r.content)
+        md.write_text(articles_markdown(db, f"{index['edition']['description']}, {index['issue']['description']}"),
+                      encoding="utf-8")
+        print(f"Saved the articles: {db.name} and {md.name}")
+    except Exception as e:  # the PDF is the main product: the articles must not fail the run
+        print(f"Articles not saved ({type(e).__name__}: {e})")
+
+
 MODES = {  # in fallback order
     "full": (full_issue, "logging in and downloading the PDF of the whole edition"),
     "pages": (pdf_issue, "downloading the PDF of each page"),
@@ -257,9 +356,11 @@ MODES = {  # in fallback order
 
 
 def prune(keep_days, outdir):
-    """Delete the issue PDFs in OUTDIR, and the tile folders of failed runs, last modified over KEEP_DAYS days ago."""
+    """Delete the issues in OUTDIR (PDF, articles database and Markdown), and the tile folders of failed runs,
+    last modified over KEEP_DAYS days ago."""
     oldest = dt.date.today() - dt.timedelta(days=keep_days)
-    for p in [*outdir.glob("IlSole24Ore_*.pdf"), *(DATA / "download").glob("*_*")]:
+    issues = [p for p in outdir.glob("IlSole24Ore_*") if p.suffix in (".pdf", ".db", ".md")]
+    for p in [*issues, *(DATA / "download").glob("*_*")]:
         if dt.date.fromtimestamp(p.stat().st_mtime) < oldest:
             if p.is_dir():
                 shutil.rmtree(p, ignore_errors=True)
@@ -279,16 +380,41 @@ def main():
                     help="full (default): the publisher's PDF of the whole edition, with text, after the SSO login "
                          "set in .env; pages: the PDF of each page (images), no login; tiles: the page images in "
                          "tiles, no login. A mode that fails falls back to the next ones")
+    ap.add_argument("--edition", metavar="CODE",
+                    help="an edition or supplement instead of the daily newspaper (e.g. PLUS, DOMENICA, RAPPORTO), "
+                         "or 'all' for every edition of that date; --list-editions shows the codes")
+    ap.add_argument("--list-editions", action="store_true",
+                    help="list the editions and supplements of the last weeks, then exit")
     args = ap.parse_args()
     load_env()
     if args.keep_days is not None:
         prune(args.keep_days, args.outdir)
-    day = args.date
 
     s = session()
+    if args.list_editions:
+        for edition, days in sorted(newsstand(s).items()):
+            print(f"{edition:22} {len(days):3} issues, latest {days[-1]}")
+        return
     print("Looking for the issue...", flush=True)
-    day, index = find_issue(s, day)
-    out = args.outdir / f"IlSole24Ore_{day:%Y-%m-%d}.pdf"
+    if not args.edition:
+        targets = [find_issue(s, args.date)]
+    elif args.edition.lower() == "all":
+        day = args.date or find_issue(s)[0]
+        targets = [(day, index) for edition in sorted(newsstand(s)) if (index := issue_index(s, day, edition))]
+        if not targets:
+            sys.exit(f"No edition found for {day}")
+    else:  # without a date: the latest issue the newsstand lists (supplements can be monthly), else the last days
+        edition = args.edition.upper()
+        listed = [] if args.date else newsstand(s).get(edition, [])
+        targets = [find_issue(s, args.date or (listed[-1] if listed else None), (edition,))]
+    for day, index in targets:
+        download_issue(s, day, index, args)
+
+
+def download_issue(s, day, index, args):
+    """Save one issue as a PDF, in the first mode that works, and its articles."""
+    edition = index["edition"]["code"]
+    out = args.outdir / (f"IlSole24Ore_{day:%Y-%m-%d}.pdf" if edition in DAILY else f"IlSole24Ore_{day:%Y-%m-%d}_{edition}.pdf")
     if out.is_file():
         print(f"Already downloaded: {out}")
         return
@@ -313,6 +439,7 @@ def main():
     out.with_suffix(".part").replace(out)
     shutil.rmtree(tiledir, ignore_errors=True)  # a file held open (antivirus) must not fail a saved issue
     print(f"Saved {out} ({out.stat().st_size / 1e6:,.0f} MB)")
+    save_articles(s, index, out)
 
 
 if __name__ == "__main__":
