@@ -9,4 +9,23 @@ or `uv run python src/ilsole24ore_dl.py [YYYY-MM-DD]`. The PDF is saved as `data
 
 Daily download: `powershell -ExecutionPolicy Bypass -File register_daily_task.ps1` registers a Windows scheduled task that every day at 07:00 (or as soon as the PC is back on, once a network is up, also on battery) deletes the issues downloaded over 7 days ago and downloads the latest one; its output goes to `data/download_latest_issue.log`.
 
-How it works: the viewer's issue index lists the pages; each page is downloaded as 8 image tiles (in parallel, cached in `data/download/` so an interrupted run resumes), stitched at full resolution, cropped to the printed area and merged into the PDF without re-encoding. No browser and no ImageMagick are needed. `python src/test_ilsole24ore_dl.py` checks the stitching, the cropping, the cleanup and the choice of the issue offline.
+How it works: the viewer's issue index lists the pages. Each page is downloaded as the PDF the viewer serves for it (one 200 dpi JPEG per page, no text layer), in parallel and cached in `data/download/` so an interrupted run resumes, and the pages are merged into one PDF (about 7 s and 75 MB for 32 pages). If a page PDF is missing or fails, the issue is built from the page images instead: 8 image tiles per page, stitched at full resolution, cropped to the printed area and merged without re-encoding. No login, no browser and no ImageMagick are needed. `python src/test_ilsole24ore_dl.py` checks the stitching, the cropping, the cleanup, the choice of the issue, the merging of the page PDFs and the fallback to the tiles offline.
+
+## Show the viewer's PDF save button
+
+With institutional (SSO) access the viewer hides its "Salvataggio PDF" button (the download icon at the right end of the bottom bar). `ilsole24ore_save_button.user.css` shows it again. It only changes how the page looks: whether the PDF can be downloaded is still decided by the site and by the terms of your subscription.
+
+Install it in one of these ways; the first two need no restart and are edited from the browser.
+
+- **uBlock Origin** (already installed in many browsers): Dashboard → "My filters", add this line and click "Apply changes":
+  ```
+  quotidiano.ilsole24ore.com##body.classe_sso a#saveButton:style(display: block !important)
+  ```
+- **Stylus** (Firefox, Chrome, Edge): install it from the browser's add-on store, open "Manage" → "Write new style", paste the content of `ilsole24ore_save_button.user.css` and save.
+- **Firefox, no extension** (`userContent.css`):
+  1. In `about:config` set `toolkit.legacyUserProfileCustomizations.stylesheets` to `true`.
+  2. In `about:support`, next to "Profile Folder", click "Open Folder"; create a subfolder `chrome` if there is none.
+  3. Copy `ilsole24ore_save_button.user.css` into `chrome` as `userContent.css` (if that file already exists, paste the content at its end).
+  4. Restart Firefox, which reads `userContent.css` only at startup. Every later change needs the file edited and another restart.
+
+Check: open an issue in the viewer (`quotidiano.ilsole24ore.com/sfoglio/...`) and reload it; the download icon appears at the right end of the bottom bar.

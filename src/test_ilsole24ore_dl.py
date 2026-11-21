@@ -1,6 +1,7 @@
-"""Offline check of stitch(), crop(), prune() and find_issue(): python src/test_ilsole24ore_dl.py"""
+"""Offline check of stitch(), crop(), prune(), find_issue() and main(): python src/test_ilsole24ore_dl.py"""
 
 import datetime as dt
+import io
 import os
 import sys
 import tempfile
@@ -9,6 +10,7 @@ import types
 from pathlib import Path
 
 from PIL import Image, ImageDraw
+from pypdf import PdfReader, PdfWriter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ilsole24ore_dl as m  # noqa: E402
@@ -47,7 +49,7 @@ with tempfile.TemporaryDirectory() as tmp:
         (m.DATA / name).write_bytes(b"")
         os.utime(m.DATA / name, (noon(age), noon(age)))
     os.utime(m.DATA / "download/20261101_SOLE", (noon(8), noon(8)))  # the folder of a run failed 8 days ago
-    m.prune(7)
+    m.prune(7, m.DATA / "final")
     assert not (m.DATA / "download/20261101_SOLE").exists()
     for name, (_age, kept) in files.items():
         if not name.startswith("download/"):
@@ -76,7 +78,8 @@ for day, msg in ((None, "No issue found for 2026-11-08 to 2026-11-16"), (dt.date
     except SystemExit as e:
         assert str(e) == msg, e
 
-# main: a failed tile stops the run at once, without downloading the rest of the queue
+# main: an index without page PDFs falls back to the tiles; a failed tile stops the run at once,
+# without downloading the rest of the queue
 def fake_fetch(s, url, path):
     started.append(url)
     if url.endswith("p0/0.gif"):
@@ -95,4 +98,23 @@ with tempfile.TemporaryDirectory() as tmp:
     except RuntimeError as e:
         assert str(e) == "tile missing", e
 assert len(started) < 2 * m.DOWNLOAD_THREADS, len(started)
+
+
+# main: the page PDFs are merged in page order, and the downloads folder is removed
+def pdf_fetch(s, url, path, magic=b"GIF"):
+    assert magic == b"%PDF", url
+    w, buf = PdfWriter(), io.BytesIO()
+    w.add_blank_page(width=100 + int(url[len(m.CDN) + 1:-4]), height=100)  # the width tells the page apart
+    w.write(buf)
+    path.write_bytes(buf.getvalue())
+
+
+index["pages"] = [{"page": n, "secret": f"s{n}", "pdf": f"p{n}.pdf", "splitted": f"p{n}"} for n in (2, 0, 1)]
+m.fetch = pdf_fetch
+with tempfile.TemporaryDirectory() as tmp:
+    m.DATA = Path(tmp)
+    m.main()
+    widths = [float(p.mediabox.width) for p in PdfReader(m.DATA / "final/IlSole24Ore_2026-11-15.pdf").pages]
+    assert widths == [100, 101, 102], widths
+    assert not (m.DATA / "download/20261115_SOLE").exists()
 print("ok")

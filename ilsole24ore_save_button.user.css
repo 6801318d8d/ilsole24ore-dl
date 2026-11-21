@@ -1,0 +1,11 @@
+/* ==UserStyle==
+@name         Il Sole 24 Ore: show the PDF save button
+@namespace    ilsole24ore-dl
+@version      1.0.0
+@description  Shows the "Salvataggio PDF" button of the digital edition viewer, which the site hides for institutional (SSO) access.
+==/UserStyle== */
+
+/* The viewer's css2012/style.css hides it with: body.classe_sso a#saveButton { display: none; } */
+@-moz-document domain("quotidiano.ilsole24ore.com") {
+  body.classe_sso a#saveButton { display: block !important; }
+}

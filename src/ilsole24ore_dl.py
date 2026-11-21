@@ -5,11 +5,12 @@
     python src/ilsole24ore_dl.py --keep-days 7   first delete the issues downloaded over 7 days ago
     python src/ilsole24ore_dl.py --outdir DIR    save the issues in DIR (default: data/final)
 
-The viewer's issue index (get_timone.php) lists the pages; each page is served as
-8 GIF tiles (2 columns x 4 rows). All tiles are downloaded at once (cached in
-data/download/, so an interrupted run resumes); then each page is stitched at full
-resolution, cropped to the printed area and JPEG-encoded as soon as its tiles are in, and
-the pages are merged without re-encoding into data/final/IlSole24Ore_<date>.pdf.
+The viewer's issue index (get_timone.php) lists the pages. Each page is served as a
+PDF (one 200 dpi JPEG, no text layer): all of them are downloaded at once (cached in
+data/download/, so an interrupted run resumes) and merged into data/final/IlSole24Ore_<date>.pdf.
+If a page PDF is missing or fails, the issue is built from the page images instead:
+8 GIF tiles per page (2 columns x 4 rows), stitched at full resolution, cropped to the
+printed area, JPEG-encoded and merged without re-encoding.
 """
 
 import argparse
@@ -17,12 +18,13 @@ import datetime as dt
 import io
 import shutil
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import img2pdf
 import requests
 from PIL import Image, ImageChops
+from pypdf import PdfWriter
 from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 from urllib3.util.retry import Retry
@@ -69,14 +71,14 @@ def find_issue(s, day=None):
     sys.exit(f"No issue found for {days[-1]}" + (f" to {days[0]}" if len(days) > 1 else ""))
 
 
-def fetch(s, url, path):
-    """Download a tile, unless it is already cached."""
+def fetch(s, url, path, magic=b"GIF"):
+    """Download a tile (or, with magic=b"%PDF", a page PDF), unless it is already cached."""
     if path.is_file():
         return
     r = s.get(url, timeout=(10, 60))
     r.raise_for_status()
-    if not r.content.startswith(b"GIF"):
-        raise RuntimeError(f"not a GIF: {url}")
+    if not r.content.startswith(magic):
+        raise RuntimeError(f"not a {magic.decode().strip('%')}: {url}")
     part = path.with_suffix(".part")
     part.write_bytes(r.content)
     part.replace(path)
@@ -112,6 +114,47 @@ def page_jpeg(tile_paths):
     buf = io.BytesIO()
     crop(stitch(tiles)).save(buf, "JPEG", quality=JPEG_QUALITY, dpi=(DPI, DPI))
     return buf.getvalue()
+
+
+def pdf_issue(s, pages, folder):
+    """The issue as PDF bytes, merged from the PDF of each page (cached in FOLDER)."""
+    paths = [folder / f"{p['secret']}.pdf" for p in pages]
+    urls = [CDN + p["pdf"].strip() for p in pages]  # KeyError on an index without page PDFs: the caller falls back
+    with ThreadPoolExecutor(DOWNLOAD_THREADS) as dl:
+        jobs = [dl.submit(fetch, s, url, path, b"%PDF") for url, path in zip(urls, paths, strict=True)]
+        try:
+            for f in tqdm(as_completed(jobs), total=len(jobs), unit="page"):
+                f.result()  # re-raises a failed download
+        except BaseException:  # a failed page or Ctrl+C: drop the queued downloads instead of waiting for them
+            dl.shutdown(cancel_futures=True)
+            raise
+    w = PdfWriter()
+    for path in paths:
+        w.append(io.BytesIO(path.read_bytes()))  # no open handle blocks the cleanup
+    buf = io.BytesIO()
+    w.write(buf)
+    return buf.getvalue()
+
+
+def tile_issue(s, pages, folder):
+    """The issue as PDF bytes, built from the image tiles of each page (cached in FOLDER)."""
+    paths = [[folder / f"{p['secret']}_{i}.gif" for i in range(TILES)] for p in pages]
+    # All tiles are queued at once, in page order; each page is built as soon as its tiles are in
+    with ThreadPoolExecutor(DOWNLOAD_THREADS) as dl, ThreadPoolExecutor(PAGE_THREADS) as cpu:
+        fetched = [[dl.submit(fetch, s, f"{CDN}{p['splitted']}/{i}.gif", path) for i, path in enumerate(pp)]
+                   for p, pp in zip(pages, paths, strict=True)]
+
+        def build(n):
+            for f in fetched[n]:
+                f.result()  # re-raises a failed download
+            return page_jpeg(paths[n])
+
+        try:
+            jpegs = list(tqdm(cpu.map(build, range(len(pages))), total=len(pages), unit="page"))
+        except BaseException:  # a failed tile or Ctrl+C: drop the queued downloads instead of waiting for them
+            dl.shutdown(cancel_futures=True)
+            raise
+    return img2pdf.convert(jpegs)
 
 
 def prune(keep_days, outdir):
@@ -150,25 +193,15 @@ def main():
 
     tiledir = DATA / "download" / f"{day:%Y%m%d}_{index['edition']['code']}"
     tiledir.mkdir(parents=True, exist_ok=True)
-    paths = [[tiledir / f"{p['secret']}_{i}.gif" for i in range(TILES)] for p in pages]
-    # All tiles are queued at once, in page order; each page is built as soon as its tiles are in
-    with ThreadPoolExecutor(DOWNLOAD_THREADS) as dl, ThreadPoolExecutor(PAGE_THREADS) as cpu:
-        fetched = [[dl.submit(fetch, s, f"{CDN}{p['splitted']}/{i}.gif", path) for i, path in enumerate(pp)]
-                   for p, pp in zip(pages, paths, strict=True)]
-
-        def build(n):
-            for f in fetched[n]:
-                f.result()  # re-raises a failed download
-            return page_jpeg(paths[n])
-
-        try:
-            jpegs = list(tqdm(cpu.map(build, range(len(pages))), total=len(pages), unit="page"))
-        except BaseException:  # a failed tile or Ctrl+C: drop the queued downloads instead of waiting for them
-            dl.shutdown(cancel_futures=True)
-            raise
+    print("Downloading the page PDFs...", flush=True)
+    try:
+        pdf = pdf_issue(s, pages, tiledir)
+    except Exception as e:  # any failure of the PDF route (not Ctrl+C): build the issue from the page images
+        print(f"Page PDFs not available ({type(e).__name__}: {e}); downloading the page images instead", flush=True)
+        pdf = tile_issue(s, pages, tiledir)
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.with_suffix(".part").write_bytes(img2pdf.convert(jpegs))
+    out.with_suffix(".part").write_bytes(pdf)
     out.with_suffix(".part").replace(out)
     shutil.rmtree(tiledir, ignore_errors=True)  # a file held open (antivirus) must not fail a saved issue
     print(f"Saved {out} ({out.stat().st_size / 1e6:,.0f} MB)")
