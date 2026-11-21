@@ -1,5 +1,6 @@
 # Register (or update) the Windows scheduled task that every day at 07:00 deletes the issues downloaded
-# over 7 days ago and downloads the latest one. Output and errors go to data\download_latest_issue.log.
+# over 7 days ago and downloads every edition of the latest issue (the daily newspaper and the supplements
+# of that day). Output and errors go to data\download_latest_issue.log.
 #     powershell -ExecutionPolicy Bypass -File register_daily_task.ps1
 $ErrorActionPreference = "Stop"
 $name = "ilsole24ore-dl daily"
@@ -8,7 +9,7 @@ $uv = (Get-Command uv).Source
 $log = "$proj\data\download_latest_issue.log"
 New-Item -ItemType Directory -Force "$proj\data" | Out-Null
 # cmd /c strips the outer quotes; the window is headless, so everything goes to the log
-$cmdline = "/c `"(echo ===== %date% %time% & `"$uv`" run --directory `"$proj`" python src\ilsole24ore_dl.py --keep-days 7) >> `"$log`" 2>&1`""
+$cmdline = "/c `"(echo ===== %date% %time% & `"$uv`" run --directory `"$proj`" python src\ilsole24ore_dl.py --keep-days 7 --edition all) >> `"$log`" 2>&1`""
 $action = New-ScheduledTaskAction -Execute "conhost.exe" -Argument "--headless cmd.exe $cmdline" -WorkingDirectory $proj
 $trigger = New-ScheduledTaskTrigger -Daily -At "07:00"
 # A run missed while the PC was off starts when it is back on, only once a network is up, also on battery

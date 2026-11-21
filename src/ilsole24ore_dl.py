@@ -417,6 +417,8 @@ def download_issue(s, day, index, args):
     out = args.outdir / (f"IlSole24Ore_{day:%Y-%m-%d}.pdf" if edition in DAILY else f"IlSole24Ore_{day:%Y-%m-%d}_{edition}.pdf")
     if out.is_file():
         print(f"Already downloaded: {out}")
+        if not out.with_suffix(".db").is_file():  # an issue saved before the articles were saved too
+            save_articles(s, index, out)
         return
     index["pages"] = sorted(index["pages"], key=lambda p: p["page"])
     print(f"{index['edition']['description']}, {index['issue']['description']}: {len(index['pages'])} pages", flush=True)
