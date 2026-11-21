@@ -7,7 +7,7 @@ download_latest_issue.bat 2026-11-16   # the issue of a given date
 
 or `uv run python src/ilsole24ore_dl.py [YYYY-MM-DD] [--mode full|pages|tiles] [--edition CODE|all]` (see "Modes" and "Editions and supplements"). The PDF is saved as `data/final/IlSole24Ore_<date>.pdf` (another folder with `--outdir DIR`), with the articles next to it (see "Articles"); an issue already downloaded is skipped. `--keep-days N` first deletes the issues in that folder (PDF, `.db` and `.md`, and the tiles of failed runs) last modified over N days ago.
 
-Daily download: `powershell -ExecutionPolicy Bypass -File register_daily_task.ps1` registers a Windows scheduled task that every day at 07:00 (or as soon as the PC is back on, once a network is up, also on battery) deletes the issues downloaded over 7 days ago and downloads every edition of the latest issue (`--edition all`: the daily newspaper and the supplements of that day); its output goes to `data/download_latest_issue.log`.
+Daily download: `powershell -ExecutionPolicy Bypass -File register_daily_task.ps1` registers a Windows scheduled task that every day at 07:00 (or as soon as the PC is back on, once a network is up, also on battery) deletes the issues downloaded over 7 days ago and downloads every edition of the latest issue (`--edition all`: the daily newspaper and the supplements of that day); its output goes to `data/download_latest_issue.log`. To run it now, with the same arguments, double-click `run_daily_task.bat` (or `powershell -ExecutionPolicy Bypass -File run_daily_task.ps1`): it starts the task and shows its log until the task ends.
 
 ## Modes
 
