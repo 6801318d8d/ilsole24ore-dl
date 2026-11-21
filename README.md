@@ -5,11 +5,31 @@ download_latest_issue.bat              # the latest issue
 download_latest_issue.bat 2026-11-16   # the issue of a given date
 ```
 
-or `uv run python src/ilsole24ore_dl.py [YYYY-MM-DD]`. The PDF is saved as `data/final/IlSole24Ore_<date>.pdf` (another folder with `--outdir DIR`); an issue already downloaded is skipped. `--keep-days N` first deletes the issues in that folder (and the tiles of failed runs) last modified over N days ago.
+or `uv run python src/ilsole24ore_dl.py [YYYY-MM-DD] [--mode full|pages|tiles]` (see "Modes"). The PDF is saved as `data/final/IlSole24Ore_<date>.pdf` (another folder with `--outdir DIR`); an issue already downloaded is skipped. `--keep-days N` first deletes the issues in that folder (and the tiles of failed runs) last modified over N days ago.
 
 Daily download: `powershell -ExecutionPolicy Bypass -File register_daily_task.ps1` registers a Windows scheduled task that every day at 07:00 (or as soon as the PC is back on, once a network is up, also on battery) deletes the issues downloaded over 7 days ago and downloads the latest one; its output goes to `data/download_latest_issue.log`.
 
-How it works: the viewer's issue index lists the pages. Each page is downloaded as the PDF the viewer serves for it (one 200 dpi JPEG per page, no text layer), in parallel and cached in `data/download/` so an interrupted run resumes, and the pages are merged into one PDF (about 7 s and 75 MB for 32 pages). If a page PDF is missing or fails, the issue is built from the page images instead: 8 image tiles per page, stitched at full resolution, cropped to the printed area and merged without re-encoding. No login, no browser and no ImageMagick are needed. `python src/test_ilsole24ore_dl.py` checks the stitching, the cropping, the cleanup, the choice of the issue, the merging of the page PDFs and the fallback to the tiles offline.
+## Modes
+
+`--mode` chooses how the issue is obtained; a mode that fails (no login settings, login refused, a file missing) falls back to the next one, in this order:
+
+| `--mode` | What you get | Login | Time and size (32 pages) |
+|---|---|---|---|
+| `full` (default) | the publisher's PDF of the whole edition: vector text you can search and copy, embedded fonts, pictures at 150 dpi; every page carries a line with the institutional account and a code | institutional (Shibboleth) login, from `.env` | about 8 s, 34 MB |
+| `pages` | the PDF the viewer serves for each page, merged: one 200 dpi image per page, no text | none | about 7 s, 75 MB |
+| `tiles` | the page images, 8 tiles per page, stitched at full resolution, cropped to the printed area and merged without re-encoding | none | about 50 MB |
+
+`pages` and `tiles` are downloaded in parallel and cached in `data/download/`, so an interrupted run resumes. No browser and no ImageMagick are needed.
+
+Login for `full`: copy `.env.example` to `.env` and fill it in. `.env` is in `.gitignore`: never commit it.
+
+- `SOLE_LOGIN_URL`: the institutional access link to the newspaper that your library catalogue gives (it leads to the page where you pick your institution);
+- `SOLE_IDP`: the entityID of your institution's Shibboleth identity provider (the `entityID` parameter of your institution's link on that page);
+- `SOLE_USERNAME`, `SOLE_PASSWORD`: your institutional credentials.
+
+The script logs in like a browser: it picks the institution, fills the identity provider's login form, accepts the release of the attributes to the publisher, and posts the answer back to the publisher's site, which opens the session; then it asks for the whole edition, as the viewer's "save" button does, and extracts the PDF from the ZIP the server sends.
+
+`python src/test_ilsole24ore_dl.py` checks offline the stitching, the cropping, the cleanup, the choice of the issue, the merging of the page PDFs, the extraction of the full PDF and the fallback from one mode to the next.
 
 ## Show the viewer's PDF save button
 

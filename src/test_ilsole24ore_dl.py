@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import types
+import zipfile
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -87,6 +88,12 @@ def fake_fetch(s, url, path):
     time.sleep(0.2)
 
 
+def no_login(s):
+    raise RuntimeError("no login in the test")
+
+
+# the default mode (full) fails without a login and falls back to pages, then to tiles; the real .env is not read
+m.load_env, m.sso_login = (lambda: None), no_login
 pages = [{"page": n, "secret": f"s{n}", "splitted": f"p{n}"} for n in range(40)]  # 320 tiles
 index = {"pages": pages, "edition": {"description": "E", "code": "SOLE"}, "issue": {"description": "I"}}
 m.find_issue, m.fetch, sys.argv, started = (lambda s, day: (dt.date(2026, 11, 15), index)), fake_fetch, ["test"], []
@@ -117,4 +124,41 @@ with tempfile.TemporaryDirectory() as tmp:
     widths = [float(p.mediabox.width) for p in PdfReader(m.DATA / "final/IlSole24Ore_2026-11-15.pdf").pages]
     assert widths == [100, 101, 102], widths
     assert not (m.DATA / "download/20261115_SOLE").exists()
+
+
+# full_issue: the PDF inside the server's ZIP; an answer that is not a ZIP raises
+class FakeResponse:
+    def __init__(self, body):
+        self.body, self.headers = body, {"content-length": str(len(body))}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, size):
+        yield self.body
+
+
+zbuf = io.BytesIO()
+with zipfile.ZipFile(zbuf, "w") as z:
+    z.writestr("S24-20261115-SOLE.pdf", b"%PDF-1.7 whole")
+full_index = {"newspaper": {"code": "S24"}, "edition": {"code": "SOLE", "id": 1}, "issue": {"code": "20261115"}, "version": 1}
+m.sso_login = lambda s: None
+for body, expected in ((zbuf.getvalue(), b"%PDF-1.7 whole"), (b"DOWNLOAD_KO_USER_INVALID", None)):
+    fake = types.SimpleNamespace(post=lambda url, **kw: FakeResponse(body))
+    try:
+        assert m.full_issue(fake, full_index, None) == expected
+    except RuntimeError as e:
+        assert expected is None and "no ZIP" in str(e), e
+
+# FirstForm: only the first form, without checkboxes and buttons
+form = m.FirstForm('<form action="/a"><input type="hidden" name="h" value="1"><input name="t">'
+                   '<input type="checkbox" name="c" value="x"><input type="submit" name="s"></form>'
+                   '<form action="/b"><input name="other"></form>')
+assert (form.action, form.fields) == ("/a", [("h", "1"), ("t", "")]), (form.action, form.fields)
 print("ok")

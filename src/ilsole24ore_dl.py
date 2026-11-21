@@ -4,22 +4,29 @@
     python src/ilsole24ore_dl.py 2026-11-16   issue of that date
     python src/ilsole24ore_dl.py --keep-days 7   first delete the issues downloaded over 7 days ago
     python src/ilsole24ore_dl.py --outdir DIR    save the issues in DIR (default: data/final)
+    python src/ilsole24ore_dl.py --mode pages    how to get the issue: full (default), pages or tiles
 
-The viewer's issue index (get_timone.php) lists the pages. Each page is served as a
-PDF (one 200 dpi JPEG, no text layer): all of them are downloaded at once (cached in
-data/download/, so an interrupted run resumes) and merged into data/final/IlSole24Ore_<date>.pdf.
-If a page PDF is missing or fails, the issue is built from the page images instead:
-8 GIF tiles per page (2 columns x 4 rows), stitched at full resolution, cropped to the
-printed area, JPEG-encoded and merged without re-encoding.
+The viewer's issue index (get_timone.php) lists the pages. The issue is saved as
+data/final/IlSole24Ore_<date>.pdf in one of three modes; a mode that fails falls back to the next:
+- full: the publisher's PDF of the whole edition (vector text), after the institutional
+  Shibboleth login set in .env (SOLE_LOGIN_URL, SOLE_IDP, SOLE_USERNAME, SOLE_PASSWORD);
+- pages: the PDF of each page (one 200 dpi JPEG, no text layer), no login;
+- tiles: 8 GIF tiles per page (2 columns x 4 rows), stitched at full resolution, cropped to
+  the printed area, JPEG-encoded and merged without re-encoding; no login.
+Pages and tiles are downloaded at once and cached in data/download/, so an interrupted run resumes.
 """
 
 import argparse
 import datetime as dt
 import io
+import os
 import shutil
 import sys
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import img2pdf
 import requests
@@ -30,6 +37,7 @@ from tqdm import tqdm
 from urllib3.util.retry import Retry
 
 INDEX_URL = "https://www.quotidiano.ilsole24ore.com/sfoglio/_resources/php/get_timone.php"
+PDF_URL = "https://www.quotidiano.ilsole24ore.com/sfoglio/_resources/php/get_pdf.php"  # the viewer's "save the whole issue"
 CDN = "https://mobapp2.ilsole24ore.com/_deploy/"
 TILES = 8  # per page, 2 columns x 4 rows
 LOOKBACK_DAYS = 7  # latest issue: from tomorrow (published the evening before) back this many days
@@ -40,7 +48,17 @@ MARGIN = 20  # px kept around the printed area
 CROP_SCALE = 4  # the blank border is measured on the page reduced 4 times: 4 px accuracy, 16x fewer pixels
 JPEG_QUALITY = 85  # same look as 92 at 200 % zoom (PSNR 40 dB), 49 MB instead of 63 MB per issue
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-DATA = Path(__file__).resolve().parent.parent / "data"
+ROOT = Path(__file__).resolve().parent.parent
+DATA = ROOT / "data"
+
+
+def load_env(path=ROOT / ".env"):
+    """KEY=value lines of .env into os.environ; a variable already set wins."""
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and not key.lstrip().startswith("#"):
+                os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
 def session():
@@ -116,8 +134,81 @@ def page_jpeg(tile_paths):
     return buf.getvalue()
 
 
-def pdf_issue(s, pages, folder):
+class FirstForm(HTMLParser):
+    """The action and the (name, value) fields of a page's first form; checkboxes, radios and buttons left out."""
+
+    def __init__(self, html):
+        super().__init__()
+        self.action, self.fields, self.done = None, [], False
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "form" and self.action is None:
+            self.action = a.get("action") or ""
+        elif tag == "input" and self.action is not None and not self.done and a.get("name") \
+                and (a.get("type") or "text").lower() in ("hidden", "text", "password", "email"):
+            self.fields.append((a["name"], a.get("value") or ""))
+
+    def handle_endtag(self, tag):
+        self.done = self.done or (tag == "form" and self.action is not None)
+
+
+def sso_login(s):
+    """Log session S in through the institutional Shibboleth login set in .env."""
+    cfg = {k: os.environ.get(f"SOLE_{k}") for k in ("LOGIN_URL", "IDP", "USERNAME", "PASSWORD")}
+    if missing := [f"SOLE_{k}" for k, v in cfg.items() if not v]:
+        raise RuntimeError(f"missing in .env: {', '.join(missing)}")
+    r = s.get(cfg["LOGIN_URL"], timeout=(10, 30))  # ends on the federation's page that picks the institution
+    if not (ret := parse_qs(urlparse(r.url).query).get("return")):
+        raise RuntimeError(f"no institution picker after SOLE_LOGIN_URL: {r.url}")
+    r = s.get(f"{ret[0]}&entityID={quote(cfg['IDP'], safe='')}", timeout=(10, 30))
+    for _ in range(10):  # the identity provider's pages, then the forms that post the login back to the publisher
+        form = FirstForm(r.text)
+        if form.action is None:
+            break
+        names = {n for n, _ in form.fields}
+        fields = form.fields
+        if "j_username" in names:
+            fields = [(n, v) for n, v in fields if n not in ("j_username", "j_password")]
+            fields += [("j_username", cfg["USERNAME"]), ("j_password", cfg["PASSWORD"]), ("_eventId_proceed", "")]
+        elif "shib_idp_ls_supported" in names:  # the page that tests the browser's local storage
+            fields = [(n, "false" if n == "shib_idp_ls_supported" else v) for n, v in fields]
+        elif "_shib_idp_consentIds" in names:  # release of the attributes to the publisher
+            fields += [("_shib_idp_consentOptions", "_shib_idp_rememberConsent"), ("_eventId_proceed", "Accept")]
+        r = s.post(urljoin(r.url, form.action), data=fields, timeout=(10, 60))
+        if "j_username" in names and 'name="j_password"' in r.text:
+            raise RuntimeError("login refused: check SOLE_USERNAME and SOLE_PASSWORD in .env")
+    if "SoleAuth" not in s.cookies:
+        raise RuntimeError(f"no session after the login (last page: {r.url})")
+
+
+def full_issue(s, index, folder):
+    """The issue as PDF bytes: the publisher's PDF of the whole edition, after the SSO login."""
+    sso_login(s)
+    code, issue = index["edition"]["code"], index["issue"]["code"]
+    data = {"pdf_files": f"{index['newspaper']['code']}-{issue}-{code}-whole.pdf", "edition_id": index["edition"]["id"],
+            "newspaper": index["newspaper"]["code"], "edition": code, "issue": issue, "version": index["version"]}
+    with s.post(PDF_URL, data=data, timeout=(10, 120), stream=True) as r:
+        r.raise_for_status()
+        buf = io.BytesIO()
+        with tqdm(total=int(r.headers.get("content-length", 0)) or None, unit="B", unit_scale=True) as bar:
+            for chunk in r.iter_content(1 << 20):
+                buf.write(chunk)
+                bar.update(len(chunk))
+    body = buf.getvalue()
+    if not body.startswith(b"PK"):  # the server answers e.g. DOWNLOAD_KO_USER_INVALID
+        raise RuntimeError(f"no ZIP from the server: {body[:60]!r}")
+    with zipfile.ZipFile(io.BytesIO(body)) as z:
+        pdfs = [n for n in z.namelist() if n.lower().endswith(".pdf")]
+        if len(pdfs) != 1:
+            raise RuntimeError(f"expected one PDF in the ZIP, found {z.namelist()}")
+        return z.read(pdfs[0])
+
+
+def pdf_issue(s, index, folder):
     """The issue as PDF bytes, merged from the PDF of each page (cached in FOLDER)."""
+    pages = index["pages"]
     paths = [folder / f"{p['secret']}.pdf" for p in pages]
     urls = [CDN + p["pdf"].strip() for p in pages]  # KeyError on an index without page PDFs: the caller falls back
     with ThreadPoolExecutor(DOWNLOAD_THREADS) as dl:
@@ -136,9 +227,10 @@ def pdf_issue(s, pages, folder):
     return buf.getvalue()
 
 
-def tile_issue(s, pages, folder):
+def tile_issue(s, index, folder):
     """The issue as PDF bytes, built from the image tiles of each page (cached in FOLDER)."""
-    paths = [[folder / f"{p['secret']}_{i}.gif" for i in range(TILES)] for p in pages]
+    pages = index["pages"]
+    paths =[[folder / f"{p['secret']}_{i}.gif" for i in range(TILES)] for p in pages]
     # All tiles are queued at once, in page order; each page is built as soon as its tiles are in
     with ThreadPoolExecutor(DOWNLOAD_THREADS) as dl, ThreadPoolExecutor(PAGE_THREADS) as cpu:
         fetched = [[dl.submit(fetch, s, f"{CDN}{p['splitted']}/{i}.gif", path) for i, path in enumerate(pp)]
@@ -155,6 +247,13 @@ def tile_issue(s, pages, folder):
             dl.shutdown(cancel_futures=True)
             raise
     return img2pdf.convert(jpegs)
+
+
+MODES = {  # in fallback order
+    "full": (full_issue, "logging in and downloading the PDF of the whole edition"),
+    "pages": (pdf_issue, "downloading the PDF of each page"),
+    "tiles": (tile_issue, "downloading the page images"),
+}
 
 
 def prune(keep_days, outdir):
@@ -176,7 +275,12 @@ def main():
                     help="first delete the issues (and leftover tiles) last modified over N days ago")
     ap.add_argument("--outdir", type=Path, default=DATA / "final", metavar="DIR",
                     help="folder of the issue PDFs (default: data/final)")
+    ap.add_argument("--mode", choices=MODES, default="full",
+                    help="full (default): the publisher's PDF of the whole edition, with text, after the SSO login "
+                         "set in .env; pages: the PDF of each page (images), no login; tiles: the page images in "
+                         "tiles, no login. A mode that fails falls back to the next ones")
     args = ap.parse_args()
+    load_env()
     if args.keep_days is not None:
         prune(args.keep_days, args.outdir)
     day = args.date
@@ -188,17 +292,21 @@ def main():
     if out.is_file():
         print(f"Already downloaded: {out}")
         return
-    pages = sorted(index["pages"], key=lambda p: p["page"])
-    print(f"{index['edition']['description']}, {index['issue']['description']}: {len(pages)} pages", flush=True)
+    index["pages"] = sorted(index["pages"], key=lambda p: p["page"])
+    print(f"{index['edition']['description']}, {index['issue']['description']}: {len(index['pages'])} pages", flush=True)
 
     tiledir = DATA / "download" / f"{day:%Y%m%d}_{index['edition']['code']}"
     tiledir.mkdir(parents=True, exist_ok=True)
-    print("Downloading the page PDFs...", flush=True)
-    try:
-        pdf = pdf_issue(s, pages, tiledir)
-    except Exception as e:  # any failure of the PDF route (not Ctrl+C): build the issue from the page images
-        print(f"Page PDFs not available ({type(e).__name__}: {e}); downloading the page images instead", flush=True)
-        pdf = tile_issue(s, pages, tiledir)
+    modes = list(MODES)[list(MODES).index(args.mode):]
+    for i, mode in enumerate(modes):
+        print(f"Mode {mode}: {MODES[mode][1]}...", flush=True)
+        try:
+            pdf = MODES[mode][0](s, index, tiledir)
+            break
+        except Exception as e:  # any failure (not Ctrl+C) falls back to the next mode; the last one raises
+            if mode == modes[-1]:
+                raise
+            print(f"Mode {mode} failed ({type(e).__name__}: {e}); trying mode {modes[i + 1]}", flush=True)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.with_suffix(".part").write_bytes(pdf)
